@@ -1,6 +1,6 @@
 out
 *.o
-#*.so
+*.so
 *.pyc
 .config
 .idea/
