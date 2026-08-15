@@ -16,6 +16,19 @@ from-scratch custom OS/firmware for the Creality Ender-3 V3 KE.
   `klippy/extras/`. See [`docs/NEBULAOS_FORK_DIFFERENCES.md`](docs/NEBULAOS_FORK_DIFFERENCES.md) for
   the full breakdown.
 
+## Developer documentation
+
+You don't need to build this repo standalone — the canonical build/install/update/recovery
+procedures live in `NebulaOS-firmware`:
+
+- [`NebulaOS-firmware` wiki](https://github.com/coreflake1/NebulaOS-firmware/wiki)
+- [Build From Source](https://github.com/coreflake1/NebulaOS-firmware/blob/main/docs/BUILD_FROM_SOURCE.md) — how this repo's pinned commit gets fetched and cross-compiled
+- [Developer Update](https://github.com/coreflake1/NebulaOS-firmware/blob/main/docs/DEVELOPER_UPDATE.md) — how a Klipper change actually reaches a device (component update path)
+
+For this repo's own PRTouch/Z-compensation work specifically, see
+[`docs/NEBULAOS_FORK_DIFFERENCES.md`](docs/NEBULAOS_FORK_DIFFERENCES.md) and
+[`docs/prtouch_timer_incident_forensics.md`](docs/prtouch_timer_incident_forensics.md).
+
 ---
 
 Welcome to the Klipper project!
