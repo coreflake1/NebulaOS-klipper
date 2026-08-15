@@ -1,31 +1,30 @@
 # NebulaOS Klipper
 
-This is the Klipper runtime fork used by [NebulaOS](https://github.com/coreflake1/NebulaOS), a
-from-scratch custom OS/firmware for the Creality Ender-3 V3 KE.
+This is the Klipper fork [NebulaOS](https://github.com/coreflake1/NebulaOS) runs on the printer.
+The interesting NebulaOS-specific bits are mostly PRTouch (the load-cell probe), Z-compensation,
+and a bit of TMC status reporting — all in `klippy/extras/` (`prtouch_*.py`, `z_compensate.py`,
+`tmcstatus.py`, plus their tests).
 
-- **Canonical branch:** `master`.
-- **The complete OS is built via [`NebulaOS-firmware`](https://github.com/coreflake1/NebulaOS-firmware)**,
-  which pins an exact commit of this repo (`KLIPPER_PIN` in `manifests/dependencies.conf`) and fetches
-  it as part of the full build — you don't need to clone or build this repo directly to build NebulaOS.
-- **NebulaOS-specific functionality** — PRTouch (the load-cell probe), Z-compensation, and related
-  printer-specific behavior — lives in `klippy/extras/` (`prtouch_*.py`, `z_compensate.py`, `tmcstatus.py`
-  and their tests).
-- **Inherited vs. added core differences:** this fork differs from real upstream Klipper outside
-  `klippy/extras/`, but those differences predate NebulaOS's own history (inherited BTT Eddy
-  current-sensor support from this fork's base lineage) — NebulaOS's own work is fully contained in
-  `klippy/extras/`. See [`docs/NEBULAOS_FORK_DIFFERENCES.md`](docs/NEBULAOS_FORK_DIFFERENCES.md) for
-  the full breakdown.
+Branch: `master`. You don't need to clone or build this repo on its own —
+[`NebulaOS-firmware`](https://github.com/coreflake1/NebulaOS-firmware) pins an exact commit here
+and pulls it in as part of the full build.
+
+Outside `klippy/extras/`, this fork does differ from real upstream Klipper in a few places, but
+those differences predate NebulaOS entirely — they're inherited BTT Eddy current-sensor support
+from whatever this fork was built on top of, not something NebulaOS added. Everything NebulaOS
+actually wrote lives in `klippy/extras/`. See
+[`docs/NEBULAOS_FORK_DIFFERENCES.md`](docs/NEBULAOS_FORK_DIFFERENCES.md) for the full breakdown if
+you want the details.
 
 ## Developer documentation
 
-You don't need to build this repo standalone — the canonical build/install/update/recovery
-procedures live in `NebulaOS-firmware`:
+Build/install/update/recovery docs all live in `NebulaOS-firmware`, not here:
 
 - [`NebulaOS-firmware` wiki](https://github.com/coreflake1/NebulaOS-firmware/wiki)
 - [Build From Source](https://github.com/coreflake1/NebulaOS-firmware/blob/main/docs/BUILD_FROM_SOURCE.md) — how this repo's pinned commit gets fetched and cross-compiled
-- [Developer Update](https://github.com/coreflake1/NebulaOS-firmware/blob/main/docs/DEVELOPER_UPDATE.md) — how a Klipper change actually reaches a device (component update path)
+- [Developer Update](https://github.com/coreflake1/NebulaOS-firmware/blob/main/docs/DEVELOPER_UPDATE.md) — how a Klipper change actually reaches a device
 
-For this repo's own PRTouch/Z-compensation work specifically, see
+For the PRTouch/Z-compensation work specifically, see
 [`docs/NEBULAOS_FORK_DIFFERENCES.md`](docs/NEBULAOS_FORK_DIFFERENCES.md) and
 [`docs/prtouch_timer_incident_forensics.md`](docs/prtouch_timer_incident_forensics.md).
 
