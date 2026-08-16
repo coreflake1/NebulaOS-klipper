@@ -1,39 +1,52 @@
 # z_compensate - per-print auto-Z-offset orchestration, host-side Klipper extra
 #
-# NEW code, not a port - Creality's real z_compensate_wrapper.so has no published source anywhere
-# (confirmed via GitHub org-wide search, ANALYSIS.md sec 5). Design is inferred from strong
-# evidence (ANALYSIS.md sec 7): the real z_compensate_wrapper.so registers no MCU commands of its
-# own, it does lookup_object('prtouch_v2') and calls straight into its primitives, and its
-# bl_offset config value matches [bltouch]'s own y_offset exactly - consistent with probing at
-# the physical point BLTouch already homed, offset by the nozzle-to-probe-tip distance, then
-# reconciling the two readings. Named/config-section-compatible with the existing [z_compensate]
-# printer.cfg section on purpose - see ../DESIGN.md.
+# The physical model: BLTouch already knows a Z=0 for the bed (from normal G28 Z homing), but
+# a load cell mounted separately from the toolhead can measure a second, independent "where
+# does the NOZZLE actually touch the bed" reading at that exact same physical XY point. Any
+# gap between the two is real - thermal expansion, nozzle wear, a BLTouch offset that's
+# slightly off - and this module measures that gap and applies it as a live Z correction for
+# the current print. See docs/PRTOUCH_INTERNALS.md for how this fits alongside the rest of
+# the PRTouch module set, and this class's own cmd_z_offset_calibration()/_resolve_z_home_xy()
+# docstrings for the exact math and XY-reference logic.
 #
-# Real production calls this once per print, before BED_MESH_CALIBRATE (custom_macro.py's
-# CX_PRINT_LEVELING_CALIBRATION, ANALYSIS.md sec 7) - a per-print thermal/wear fine-tune, not a
-# one-time factory calibration. That matters for how the correction gets applied: baking it
-# straight into the saved probe z_offset via stock Klipper's Z_OFFSET_APPLY_PROBE + SAVE_CONFIG
-# would trigger a klippy restart in the middle of a print-start sequence, which is clearly wrong.
-# So by default this only applies the correction as a live SET_GCODE_OFFSET for the current
-# session/print - permanent persistence is opt-in (persist_offset) and needs a real, non-
-# restarting save command for whichever environment this ends up running under (Creality's own
-# stock image has a restart-free CXSAVE_CONFIG for exactly this reason; nothing has confirmed yet
-# whether pellcorp's SimpleAF environment has an equivalent - flagged as a real open question,
-# not silently assumed either way).
+# NEW code, not a port - Creality's real z_compensate_wrapper.so has no published source
+# anywhere (checked via a GitHub org-wide search during the original reverse-engineering work).
+# Design is inferred from strong indirect evidence instead: the real z_compensate_wrapper.so
+# registers no MCU commands of its own, it does lookup_object('prtouch_v2') and calls straight
+# into its primitives, and its bl_offset config value matches [bltouch]'s own y_offset exactly
+# - consistent with probing at the physical point BLTouch already homed, offset by the
+# nozzle-to-probe-tip distance, then reconciling the two readings. Named/config-section-
+# compatible with the existing [z_compensate] printer.cfg section on purpose, so a stock
+# printer.cfg drops in unchanged.
 #
-# Config-key reconciliation against the real device's live [z_compensate] section (pulled via
-# SSH 2026-08-05, see project memory): this section has its OWN tri_min_hold/tri_max_hold
-# (1400/2000, distinct from [prtouch_v2]'s own 1000/1500 defaults - a per-feature sensitivity
-# retune, not a duplicate), its own probe speed, and the wipe-pad geometry keys
-# (clr_noz_*/pa_clr_dis_mm_x/y/noz_pos_*/pumpback_mm/etc). Klipper's configfile errors on any
-# option in a section that's never read via config.get*(), so all of these are read here even
-# where their effect is genuinely unconfirmed (see "accepted but not wired" below) - pasting the
-# real section in without this would make Klipper refuse to even start.
+# Real production calls this once per print, before BED_MESH_CALIBRATE (Creality's own
+# custom_macro.py's CX_PRINT_LEVELING_CALIBRATION macro) - a per-print thermal/wear fine-tune,
+# not a one-time factory calibration. That matters for how the correction gets applied: baking
+# it straight into the saved probe z_offset via stock Klipper's Z_OFFSET_APPLY_PROBE +
+# SAVE_CONFIG would trigger a klippy restart in the middle of a print-start sequence, which is
+# clearly wrong. So by default this only applies the correction as a live SET_GCODE_OFFSET for
+# the current session/print - permanent persistence is opt-in (persist_offset) and needs a
+# real, non-restarting save command for whichever environment this ends up running under
+# (Creality's own stock image has a restart-free CXSAVE_CONFIG for exactly this reason;
+# nothing has confirmed yet whether pellcorp's SimpleAF environment has an equivalent -
+# flagged as a real open question, not silently assumed either way).
+#
+# Config-key reconciliation against a real device's live [z_compensate] section (captured
+# directly from hardware during the original reverse-engineering work, and preserved as this
+# codebase's own test fixture data - see prtouch_test_support.py's REAL_Z_COMPENSATE_CONFIG):
+# this section has its OWN tri_min_hold/tri_max_hold (1400/2000, distinct from [prtouch_v2]'s
+# own 1000/1500 defaults - a per-feature sensitivity retune, not a duplicate), its own probe
+# speed, and the wipe-pad geometry keys (clr_noz_*/pa_clr_dis_mm_x/y/noz_pos_*/pumpback_mm/
+# etc). Klipper's configfile errors on any option in a section that's never read via
+# config.get*(), so all of these are read here even where their effect is genuinely
+# unconfirmed (see "accepted but not wired" below) - pasting the real section in without this
+# would make Klipper refuse to even start.
 #
 # Because CRTENSE_NOZZLE_CLEAR must use *this* section's tuning and wipe-geometry keys (not
 # [prtouch_v2]'s), this module calls prtouch_nozzle.clear_nozzle() directly with its own `config`
 # object rather than delegating to PRTouchV2.clear_nozzle() (which is bound to [prtouch_v2]'s
-# config and has none of these keys) - matches DESIGN.md's original intent, not a new decision.
+# config and has none of these keys) - a deliberate design choice from the original rewrite,
+# not something added later.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import contextlib
@@ -44,7 +57,8 @@ from . import prtouch_mcu
 from . import prtouch_nozzle
 from . import prtouch_probe
 
-#: Structured status contract, version 1 - see docs/z_compensate_status_api.md. Consumed by
+#: Structured status contract, version 1 (this comment block is its authoritative
+#: documentation - see get_status() below for the exact field set). Consumed by
 #: GuppyScreen's recalibration wizard via printer.objects.subscribe, replacing its previous
 #: dependence on parsing this module's human-readable gcode response text (the "z_offset:"/
 #: "PR_ERR_CODE" scan). get_status() below is the only part of this contract Klipper's own
@@ -99,11 +113,11 @@ class ZCompensate:
         # temperature for the duration of the nozzle-wipe (bed_target + bed_add_temp, see
         # cmd_nozzle_clear() below). Virgin-Baseline Fix + Rebuild mission (2026-08-08):
         # maxval=100 is not an arbitrary widening - Creality's own real, factory-shipped
-        # default for this exact printer model is bed_add_temp: 60 (confirmed via
-        # artifacts/reference/stock-printer.cfg, the genuine tracked OEM config, cross-
-        # checked independently against a second, separately-derived real-device fixture -
-        # see klippy_extras/test_printer_cfg_config_validation.py). An earlier maxval=20
-        # bound rejected this genuine factory value outright, halting Klipper entirely -
+        # default for this exact printer model is bed_add_temp: 60 (confirmed against the
+        # genuine tracked OEM config during the original reverse-engineering work, cross-
+        # checked independently against a second, separately-derived real-device fixture).
+        # An earlier maxval=20 bound rejected this genuine factory value outright, halting
+        # Klipper entirely -
         # exactly the bug this comment exists to prevent recurring. 100 gives headroom
         # above the real factory value without needing to be a full physical-safety bound
         # itself: [heater_bed]'s own max_temp: 120 is the actual hard ceiling, enforced
@@ -157,7 +171,7 @@ class ZCompensate:
         # pumpback_mm (plausibly a pre-wipe retract, but unconfirmed - wiring untested E-axis
         # motion into a probe/heat sequence isn't worth the risk on a guess). Flag if any of
         # these turn out to matter after real testing - same "flagged, not silently omitted"
-        # pattern as Z_OFFSET_AUTO/env_self_check elsewhere in this file/DESIGN.md.
+        # pattern as Z_OFFSET_AUTO below.
         self.type_nozz = config.getint('type_nozz', default=0)
         self.noz_pos_center = config.getfloatlist('noz_pos_center', default=(0., 0.), count=2)
         self.noz_pos_offset = config.getfloatlist('noz_pos_offset', default=(0., 0.), count=2)
@@ -167,8 +181,8 @@ class ZCompensate:
         self.persist_offset = config.getboolean('persist_offset', default=False)
         self.save_config_command = config.get('save_config_command', default='SAVE_CONFIG')
 
-        # Structured status contract v1 (see module-level comment + docs/
-        # z_compensate_status_api.md) - independent of persist_offset above, which stays a
+        # Structured status contract v1 (see module-level comment + get_status() below) -
+        # independent of persist_offset above, which stays a
         # console/config concern; GuppyScreen's own persistence step consumes
         # calibration_z_offset directly and does its own save, regardless of this setting.
         self.calibration_id = 0
@@ -183,8 +197,8 @@ class ZCompensate:
         self.gcode.register_command('Z_OFFSET_CALIBRATION', self.cmd_z_offset_calibration,
                                      desc=self.cmd_z_offset_calibration_help)
         # Z_OFFSET_AUTO: registered by the real z_compensate_wrapper.so but never actually
-        # called by any macro on this printer (DESIGN.md open question 2, resolved: skip for
-        # v1) - not registering unless something turns out to need it.
+        # called by any macro on this printer (checked during the original reverse-engineering
+        # work) - not registering unless something turns out to need it.
 
     def _handle_connect(self):
         self.prtouch = self.printer.lookup_object('prtouch_v2')
@@ -233,8 +247,8 @@ class ZCompensate:
         return min_x + (max_x - min_x) / 2., min_y + (max_y - min_y) / 2.
 
     def get_status(self, eventtime):
-        """Structured status contract v1 - see the module-level comment and
-        docs/z_compensate_status_api.md. Deliberately does no work, no hardware access, and
+        """Structured status contract v1 - see the module-level comment above for the full
+        rationale. Deliberately does no work, no hardware access, and
         no state mutation: a fresh dict of the four already-computed fields, safe to call at
         any time (including before klippy:connect) and safe for a caller to mutate without
         touching this object's own state."""
@@ -312,11 +326,11 @@ class ZCompensate:
         own Z_OFFSET_APPLY_PROBE reads from SET_GCODE_OFFSET and subtracts from the probe's
         z_offset (verified against pellcorp/klipper's probe.py: new_calibrate = z_offset -
         offset), so setting a gcode offset equal to the raw measurement is the correct
-        equivalent of "reconciling the two readings" (ANALYSIS.md sec 7) without needing to read
+        equivalent of "reconciling the two readings" without needing to read
         the probe's current z_offset directly. tri_expand_mm (see __init__) is then applied as a
         fixed additive correction on top - see its own comment for the caveat.
         """
-        # Non-reentrancy guard (2026-08-10, see docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md -
+        # Non-reentrancy guard (2026-08-10, see docs/prtouch_timer_incident_forensics.md -
         # a live incident showed two Z_OFFSET_CALIBRATION invocations landing close together
         # while raw MCU step commands were in flight; that overlap was NOT proven to be the
         # incident's cause, but there is no legitimate reason to let a second calibration
@@ -337,7 +351,8 @@ class ZCompensate:
         # Structured status: a new attempt always gets a new id and clears any previous
         # result before doing anything else - a caller polling get_status() must never see a
         # stale "complete"/offset left over from an earlier invocation once a new one has
-        # started (see docs/z_compensate_status_api.md's ID-correlation section).
+        # started. calibration_id is the correlation field: a UI can tell "the running/complete
+        # state I'm now seeing belongs to attempt N, not whichever one I was last watching."
         self.calibration_id += 1
         self.calibration_state = "running"
         self.calibration_z_offset = None

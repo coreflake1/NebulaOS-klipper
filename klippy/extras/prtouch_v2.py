@@ -1,18 +1,33 @@
 # prtouch_v2 - load-cell/pressure-probe touch detection, host-side Klipper extra
 #
+# This is the front door of the PRTouch subsystem - the gcode commands a user or macro
+# actually calls. It owns almost no logic itself; it wires config -> PrtouchMCU (the wire
+# protocol, prtouch_mcu.py) -> PrtouchProbe (the arm/retry/safety state machine,
+# prtouch_probe.py) -> prtouch_nozzle.py (the wipe-pad sequence) and exposes the small gcode
+# surface that drives them. See docs/PRTOUCH_INTERNALS.md for the full cross-file
+# architecture picture (module map, command -> MCU -> Z-result data flow, and the two
+# independent MCU-side vs. host-side filter passes) - this header only covers what's specific
+# to this one file.
+#
 # Drop-in rewrite of Creality's compiled prtouch_v2_wrapper.so, using entirely standard Klipper
 # host APIs (the same pattern hx711s.py/dirzctl.py already prove work on this exact device).
-# Named/config-section-compatible with the existing [prtouch_v2] printer.cfg section on purpose -
-# see ../DESIGN.md's "one real design decision" section. See ../ANALYSIS.md for the full protocol
-# and algorithm this replaces.
+# Named/config-section-compatible with the existing [prtouch_v2] printer.cfg section on
+# purpose, so a stock printer.cfg drops in unchanged.
 #
 # Deliberately NOT porting: run_G28_Z/run_G29_Z/bed_mesh_post_proc/run_re_g29s/
 # correct_bed_mesh_data and their gcode entry points (CHECK_BED_MESH, ACCURATE_HOME_Z,
-# PRTOUCH_READY) - confirmed dead code in real production, BLTouch owns homing/bed-mesh
-# (ANALYSIS.md sec 7). Also not porting env_self_check/SELF_CHECK_PRTOUCH (only ever called from
-# the dead run_G28_Z path, ANALYSIS.md sec 7/8) or most of the debug/diagnostic command set
-# (TEST_PRTH, TRIG_TEST, TRIG_BED_TEST, TEST_SWAP) - cheap to add later for bring-up, not
-# blocking the real feature.
+# PRTOUCH_READY) - confirmed dead code in real production, BLTouch owns homing/bed-mesh. Also
+# not porting env_self_check/SELF_CHECK_PRTOUCH (only ever called from the dead run_G28_Z
+# path) or most of the debug/diagnostic command set (TEST_PRTH, TRIG_TEST, TRIG_BED_TEST,
+# TEST_SWAP) - cheap to add later for bring-up, not blocking the real feature.
+#
+# Lifecycle, in order: config parsing builds PrtouchMCU/PrtouchProbe/ClearNozzleConfig here in
+# __init__ (each MCU registers its own config-time setup commands via
+# register_config_callback, run once when Klipper assembles the full printer.cfg); then
+# klippy:connect resolves the heater objects clear_nozzle() needs and lets PrtouchProbe look
+# up the toolhead/bed_mesh/persisted sensor baseline. From there every gcode command below is
+# a thin, validated call into self.probe or self.clear_nozzle - the real state machine lives
+# in prtouch_probe.py, not here.
 #
 # READ_PRES (2026-08-05, first real hardware bring-up pass): one diagnostic pulled forward early,
 # specifically because it's the only command in this whole module that touches zero motion -
@@ -136,7 +151,9 @@ class PRTouchV2:
         "calibration-result persistence - it only calls PrtouchProbe.touch_probe() and reports "
         "the resulting Z sample. Requires Z already homed. 2026-08-12 physical-qualification "
         "prep: the smallest existing production-compatible path that exercises one real, "
-        "pressure-armed descent - see NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 15/16.")
+        "pressure-armed descent - see docs/prtouch_timer_incident_forensics.md for the "
+        "diagnostic planning that led to this command (a deliberately small, single-attempt "
+        "real touch to qualify hardware behavior before trusting the full retry-loop path).")
 
     def cmd_PRTOUCH_TEST_TOUCH(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')

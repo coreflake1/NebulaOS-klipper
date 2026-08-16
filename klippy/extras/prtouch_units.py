@@ -14,13 +14,13 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 #: The real device's async response ticks arrive as MCU ticks scaled by this factor
-#: (confirmed against every one of the reference's own equivalent handlers - every
-#: `params['tri_time'] / 10000` in reference/prtouch_v2_wrapper.py uses this exact divisor,
-#: e.g. its manual_get_steps handling at line 621).
+#: (confirmed against every one of Creality's own equivalent handlers in their original
+#: prtouch_v2_wrapper.py - GPLv3-licensed source, not included in this tree - every
+#: `params['tri_time'] / 10000` there uses this exact divisor).
 MCU_TICK_SCALE = 10000.
 
 #: start_pres_prtouch's tri_hftr_cut/tri_lftr_k1 fields are floats sent as fixed-point
-#: integers scaled by this factor (confirmed against reference lines 1029-1030's own
+#: integers scaled by this factor (confirmed against Creality's own original
 #: `int(use_tri_hftr_cut * 1000)` / `int(use_tri_lftr_k1 * 1000)`).
 FIXED_POINT_SCALE = 1000
 
@@ -44,16 +44,16 @@ def to_fixed_point(value, scale=FIXED_POINT_SCALE):
 
 def distance_mm_to_step_count(distance_mm, mm_per_step):
     """How many whole MCU step pulses cover a given distance. Truncates (not rounds) -
-    matches the reference's own `int(run_dis / self.mm_per_step)` exactly (get_step_cnts,
-    reference line 767)."""
+    matches Creality's own original get_step_cnts (`int(run_dis / self.mm_per_step)`)
+    exactly."""
     return int(distance_mm / mm_per_step)
 
 
 def step_count_to_step_us(distance_mm, speed_mm_s, step_count):
     """Per-step pulse period (microseconds) needed to cover distance_mm at speed_mm_s in
     exactly step_count pulses. Caller must guard step_count == 0 (division by zero) -
-    matches the reference's own get_step_cnts, which returns (0, 0, 0) for that case rather
-    than calling this at all."""
+    matches Creality's own original get_step_cnts, which returns (0, 0, 0) for that case
+    rather than calling this at all."""
     return int((distance_mm / speed_mm_s) * 1000. * 1000. / step_count)
 
 

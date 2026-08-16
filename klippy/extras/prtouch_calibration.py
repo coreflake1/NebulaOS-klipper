@@ -1,10 +1,18 @@
 # prtouch_v2 calibration math - pure functions, no MCU/reactor dependency
 #
+# This is the answer to "how do raw PRTouch samples become the Z position where the nozzle
+# actually touched the bed": compute_trigger_z() is the single entry point everything else in
+# this module set calls once a probe attempt's two raw sample buffers (step positions,
+# pressure readings) come back from the MCU. See docs/PRTOUCH_INTERNALS.md's "two
+# independent filtering passes" section for how this file's own re-filtering relates to the
+# MCU's own real-time trigger detection (they are deliberately separate; this file never
+# decides WHETHER a trigger happened, only WHERE within an already-triggered buffer it was).
+#
 # Clean-room rewrite of cal_tri_data()/get_valid_ch() from Creality's prtouch_v2_wrapper.py
-# (GPLv3, see reference/prtouch_v2_wrapper.py lines 653-763), read completely and traced in
-# ../ANALYSIS.md sec 4. Every function here takes plain numbers/lists and returns plain numbers -
-# no Klipper objects - so it can be tested standalone (see test_prtouch_calibration.py) against
-# synthetic data without a real printer.
+# (GPLv3-licensed Creality source, not included in this tree), read completely and traced
+# during the original reverse-engineering work. Every function here takes plain numbers/lists
+# and returns plain numbers - no Klipper objects - so it can be tested standalone (see
+# test_prtouch_calibration.py) against synthetic data without a real printer.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math
@@ -24,9 +32,15 @@ def select_valid_channels(tri_chs_bitmask, pres_cnt=4):
 
 def filter_pressure_series(raw_values, use_adc, acq_ms, hftr_cut, lftr_k1):
     """z-score outlier rejection + high-pass + low-pass filter (cal_tri_data/filter_datas_prtouch
-    math, ANALYSIS.md sec 4) - matches the firmware's own parallel computation so host and MCU
-    agree on the same trigger tick. Strain-gauge sensors (use_adc=False) get all three stages;
-    ADC/piezo sensors (use_adc=True) get only the low-pass stage, matching the original exactly.
+    math) - matches the firmware's own parallel computation so host and MCU agree on the same
+    trigger tick shape, though this is a HOST-side re-filter of the already-returned buffer
+    (see module docstring - the MCU's own real-time trigger decision uses its own separate
+    tri_hftr_cut/tri_lftr_k1 config, sent via start_pres_prtouch, not these hftr_cut/lftr_k1
+    parameters). Strain-gauge sensors (use_adc=False) get all three stages; ADC/piezo sensors
+    (use_adc=True) get only the low-pass stage, matching the original exactly - this rewrite
+    doesn't know Creality's own reasoning for the split, only that it's real (confirmed in the
+    wire/config structure itself, use_adc selects the whole sensor family), and preserves it
+    rather than guessing at unifying the two paths.
     """
     values = list(raw_values)
     n = len(values)
@@ -63,9 +77,18 @@ def filter_pressure_series(raw_values, use_adc, acq_ms, hftr_cut, lftr_k1):
 def find_trigger_index(filtered_values):
     """Locate the trigger sample index within a filtered pressure series.
 
-    The normalize-to-[0,1] -> tilt-angle -> rotate -> take-minimum trick (cal_tri_data,
-    ANALYSIS.md sec 4): flattens slow signal drift across the probe window so the real trigger
-    dip is findable as a global minimum even when the whole series is trending up or down.
+    The normalize-to-[0,1] -> tilt-angle -> rotate -> take-minimum trick (cal_tri_data):
+    flattens slow signal drift across the probe window so the real trigger dip is findable as
+    a global minimum even when the whole series is trending up or down. Concretely: normalize
+    every sample into [0, 1] against this window's own min/max, treat the first-to-last delta
+    as a "tilt" angle, rotate the whole series by minus that angle (undoing the trend), and
+    take the new global minimum - a genuine sharp trigger dip survives this rotation and stays
+    the minimum; a slow drift that would otherwise dominate a naive min() does not.
+
+    Equation, for n samples normalized into `normalized`:
+      angle = atan((normalized[-1] - normalized[0]) / n)
+      rotated[i] = i * sin(-angle) + normalized[i] * cos(-angle)
+      trigger_index = argmin(rotated)
     """
     n = len(filtered_values)
     min_val, max_val = min(filtered_values), max(filtered_values)
@@ -73,9 +96,10 @@ def find_trigger_index(filtered_values):
     if span <= 0:
         # Flat signal (e.g. a disconnected/stuck sensor) - no meaningful trigger dip exists.
         # The original divides by this span unconditionally and would raise ZeroDivisionError;
-        # env_self_check() is meant to catch a stuck sensor before this point is ever reached,
-        # but that self-test is deliberately out of scope for v1 (ANALYSIS.md sec 7/8), so this
-        # guards the same failure mode the self-test would have caught.
+        # a dedicated self-test command in Creality's own original wrapper (env_self_check) is
+        # meant to catch a stuck sensor before this point is ever reached, but porting that
+        # self-test is out of scope here (see prtouch_v2.py's own module comment on what was
+        # deliberately not ported), so this guards the same failure mode instead.
         return n - 1
     normalized = [(v - min_val) / span for v in filtered_values]
     angle = math.atan((normalized[-1] - normalized[0]) / n)
@@ -121,8 +145,21 @@ def compute_trigger_z(step_samples, pres_samples, step_tri_time, pres_tri_time,
     step_samples/pres_samples are the raw buffers from PrtouchMCU.collect_step_samples()/
     collect_pres_samples() (list of dicts with 'tick'/'step' or 'tick'/'ch0'..'ch3'). Averages
     the resulting Z across every channel that reported a trigger; raises ValueError if none did
-    (the MCU-side trigger detection, ANALYSIS.md sec 2, found nothing - a real no-trigger
-    condition the caller should treat as a failed probe attempt, not silently accept).
+    (the MCU-side trigger detection - see prtouch_mcu.py's start_pres() docstring - found
+    nothing on any channel; a real no-trigger condition the caller should treat as a failed
+    probe attempt, not silently accept).
+
+    Per-channel Z equation: for each triggered channel, filter its raw series
+    (filter_pressure_series), find the trigger sample within it (find_trigger_index), map that
+    tick to an interpolated step-buffer position (interpolate_trigger_step), then:
+        trigger_z = (start_step - out_step) * mm_per_step
+        channel_z = start_pos_z - trigger_z + z_offset
+    i.e. "how far short of the full commanded descent did the trigger happen, converted to mm,
+    subtracted from the toolhead's starting height" - a trigger near the very start of the
+    descent (out_step close to start_step) yields a small trigger_z and a channel_z close to
+    start_pos_z; a trigger near the end of a long commanded descent yields a channel_z well
+    below start_pos_z. The final result is the plain average of channel_z across every channel
+    that reported a trigger.
     """
     valid_channels = select_valid_channels(tri_chs_bitmask, pres_cnt)
     if not valid_channels:
