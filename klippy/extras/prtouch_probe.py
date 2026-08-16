@@ -1,21 +1,32 @@
 # prtouch_v2 touch-probe orchestration - send/poll/retry, delegates math to prtouch_calibration
 #
+# This is the probing state machine: arm a descent, wait for the MCU's response buffers,
+# hand the raw samples to prtouch_calibration.py for the actual trigger-position math, retry
+# on no-trigger/disagreement, and lift back to the starting height on every path out. Every
+# safety guard in this module set that actually stops a real motion from happening lives here.
+# See docs/PRTOUCH_INTERNALS.md for how this fits the wider command -> MCU -> Z-result
+# pipeline, and docs/prtouch_timer_incident_forensics.md for the one real MCU-shutdown
+# incident that shaped several of this file's defensive sequencing choices (search this file
+# for "settle_after_disarm" and "_own_raw_operation").
+#
 # Clean-room rewrite of Creality's run_step_prtouch()/safe_move_z()/ck_and_raise_error()
-# (prtouch_v2_wrapper.py, GPLv3, see reference/), read completely and traced in ../ANALYSIS.md
-# secs 3-4/6. Deliberately not a verbatim port (ANALYSIS.md sec 6): the Z_RefreshFlag
-# re-home-on-no-trigger branch, fast_probe's lost_min_cnt bookkeeping, and the re_g28
-# auto-rehome path all exist in the original to serve run_G28_Z/bed_mesh_post_proc, which are
-# confirmed dead code in real production (ANALYSIS.md sec 7) - this only needs to serve
-# clear_nozzle() and the new z_compensate Z_OFFSET_CALIBRATION path, both of which probe with
-# BLTouch already homed and a known-good Z reference, so a no-trigger here is a real failure to
-# surface, not a homing state to silently repair.
+# (prtouch_v2_wrapper.py, GPLv3-licensed Creality source, not included in this tree), read
+# completely and traced during the original reverse-engineering work. Deliberately not a
+# verbatim port: the Z_RefreshFlag re-home-on-no-trigger branch, fast_probe's lost_min_cnt
+# bookkeeping, and the re_g28 auto-rehome path all exist in the original to serve
+# run_G28_Z/bed_mesh_post_proc, which are confirmed dead code in real production - this only
+# needs to serve clear_nozzle() and the new z_compensate Z_OFFSET_CALIBRATION path, both of
+# which probe with BLTouch already homed and a known-good Z reference, so a no-trigger here is
+# a real failure to surface, not a homing state to silently repair.
 #
 # 2026-08-09 (load-cell safety hardening mission): three real safety gaps closed, all found
 # offline via source tracing + the fake-MCU test harness, none requiring hardware access:
 #
 #   1. No-trigger retries never lifted the toolhead back up. On a genuine no-trigger, the
-#      MCU's own step callback (reference/prtouch_v2.c's prtouch_event(), confirmed at the
-#      now_steps-- / now_steps==0 check) only stops early on a real trigger or when the full
+#      MCU's own step callback (Creality's own firmware's prtouch_event(), confirmed at the
+#      now_steps-- / now_steps==0 check against Creality's officially published source for
+#      this board - see docs/prtouch_timer_incident_forensics.md sec 7) only stops early on
+#      a real trigger or when the full
 #      commanded pulse train completes - so an empty/no-trigger buffer means the *full*
 #      commanded descent was physically executed. Klipper's own toolhead position tracking is
 #      never told about this raw, MCU-driven motion, so without an explicit compensating lift,
@@ -59,7 +70,7 @@
 # Neither is a new physical threshold requiring hardware data - both are conservative ceilings
 # on top of the existing, already-configured per-call values.
 #
-# 2026-08-10 (raw-op timer-incident mission, see docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md):
+# 2026-08-10 (raw-op timer-incident mission, see docs/prtouch_timer_incident_forensics.md):
 # a live no-trigger test of touch_probe() ended in a real MCU firmware shutdown
 # ("sentinel timer called"), preceded by five "Timer too close" MCU warnings. Source-level
 # tracing of the running firmware's exact scheduler was proven infeasible (the running
@@ -83,11 +94,11 @@
 #     grounded default available rather than an invented constant - see its own docstring.
 #
 # 2026-08-13 (redundant-recovery-lift mission): a real, non-retried PRTOUCH_TEST_TOUCH attempt
-# (docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 16) showed _fail() always issuing its own
-# 5mm safety lift even when the no-trigger recovery immediately before it had already restored
-# the full commanded descent - 3 raw disarms for a sequence that only ever needed 2. That
-# specific attempt did not crash the MCU (checked against the actual 2026-08-10 shutdown
-# incident's own timeline in sec 2 of the same doc, which stalled one level earlier, during a
+# showed _fail() always issuing its own 5mm safety lift even when the no-trigger recovery
+# immediately before it had already restored the full commanded descent - 3 raw disarms for a
+# sequence that only ever needed 2. That specific attempt did not crash the MCU (checked
+# against the actual 2026-08-10 shutdown incident's own timeline in
+# docs/prtouch_timer_incident_forensics.md sec 2, which stalled one level earlier, during a
 # recovery lift, with retries still remaining - _fail() was never reached), so this is
 # independent hardening, not a fix for that still-open incident. _fail() no longer moves at
 # all; _raw_lift() (shared by _recover_after_no_trigger/_lift_after_down) now latches
@@ -122,13 +133,46 @@ class PrtouchProbe:
         self.toolhead = None
 
         use_adc = mcu.use_adc
+        # tri_acq_ms/tri_send_ms/tri_need_cnt: passed straight through to
+        # PrtouchMCU.start_pres() as acq_ms/send_ms/need_cnt (see that method's own docstring
+        # for exactly what each does on the wire). tri_acq_ms is the pressure-sample
+        # acquisition interval; 12ms default for strain-gauge sensors (HX711-style bridges
+        # can't be read much faster than this), 1ms for use_adc=True (ADC channels sample far
+        # faster). tri_send_ms is also reused elsewhere in this class as the settle-after-
+        # disarm pacing (see _raw_op_settle_s below) since it's the MCU's own declared timing
+        # granularity on this channel. tri_need_cnt is the debounce count - how many
+        # consecutive in-band samples the MCU requires before latching a trigger; 1 means "no
+        # debounce beyond a single sample," which is this printer's current tuning.
         self.tri_acq_ms = config.getint('tri_acq_ms', default=(1 if use_adc else 12), minval=1)
         self.tri_send_ms = config.getint('tri_send_ms', default=10, minval=1)
         self.tri_need_cnt = config.getint('tri_need_cnt', default=1, minval=1)
+        # cal_hftr_cut/cal_lftr_k1: the HOST-side re-filter parameters passed to
+        # prtouch_calibration.compute_trigger_z() (-> filter_pressure_series). These are
+        # deliberately separate config keys from tri_hftr_cut/tri_lftr_k1 below, which
+        # configure the MCU's own real-time trigger detection instead - see
+        # docs/PRTOUCH_INTERNALS.md's "two independent filtering passes" section for why
+        # tuning one does not tune the other. cal_hftr_cut is a high-pass cutoff frequency
+        # (Hz-like units in the filter's own math, see filter_pressure_series); cal_lftr_k1 is
+        # a low-pass smoothing coefficient in [0, 1] (higher = less smoothing). Both only
+        # affect where WITHIN an already-triggered sample buffer the interpolated Z lands, not
+        # whether a trigger happens at all.
         self.cal_hftr_cut = config.getfloat('cal_hftr_cut', default=10., minval=0.01)
         self.cal_lftr_k1 = config.getfloat('cal_lftr_k1', default=(0.65 if use_adc else 0.85))
+        # tri_min_hold/tri_max_hold: sent to the MCU as start_pres_prtouch's own min_hold/
+        # max_hold fields (see PrtouchMCU.start_pres()'s docstring) - the filtered-signal
+        # magnitude band the MCU treats as "the load cell is being pressed," in the sensor's
+        # own raw/filtered units, NOT Newtons (the load cell's force transfer function has
+        # never been characterized on this hardware). Also reused, unscaled, as the pre-motion
+        # "already loaded before any motion" sanity proxy in _check_baseline_safe (see that
+        # method's own comment for why it deliberately reuses this threshold rather than
+        # inventing a second one). Empirically tuned on the Ender-3 V3 KE, not derived from a
+        # datasheet: too low and vibration/noise can register as a false trigger, too high and
+        # a genuine light touch can be missed entirely.
         self.tri_min_hold = config.getint('tri_min_hold', default=(3 if use_adc else 2000))
         self.tri_max_hold = config.getint('tri_max_hold', default=(3072 if use_adc else 6000))
+        # tri_hftr_cut/tri_lftr_k1: the MCU-side filter parameters (see start_pres()'s own
+        # docstring) - distinct from cal_hftr_cut/cal_lftr_k1 above, same caveat about the two
+        # filtering passes being independent.
         self.tri_hftr_cut = config.getfloat('tri_hftr_cut', default=2.0)
         self.tri_lftr_k1 = config.getfloat('tri_lftr_k1', default=(0.50 if use_adc else 0.70))
         # 'speed' is this printer's own real [prtouch_v2] key for probe descent speed - neither
@@ -142,11 +186,38 @@ class PrtouchProbe:
             minval=0.1)
         self.tri_z_up_spd = config.getfloat(
             'lift_speed', default=self.tri_z_down_spd * (1.0 if use_adc else 2.0), minval=0.1)
+        # acc_ctl_mm: the acceleration/deceleration window, in mm of travel, for the raw step
+        # pulse train (converted to a step count via prtouch_units.distance_mm_to_acc_ctl_cnt
+        # and sent as start_step_prtouch's acc_ctl_cnt - see PrtouchMCU.start_step()'s own
+        # docstring). Larger means more of each move is spent ramping speed rather than
+        # running at the full commanded rate; too small for a given speed/distance risks
+        # commanding an instantaneous speed jump the stepper can't actually make (motor
+        # stall/skipped steps) rather than a real ramp.
         self.acc_ctl_mm = config.getfloat('acc_ctl_mm', default=(0.5 if use_adc else 0.25),
                                            minval=0)
+        # low_spd_nul/send_step_duty: passed straight through to start_step_prtouch's own
+        # identically-named wire fields (see PrtouchMCU.start_step()'s docstring for the full
+        # caveat) - their wire position/name is confirmed, their precise firmware-internal
+        # meaning is NOT. Left at their stock defaults everywhere in this codebase; nothing
+        # here has ever needed to tune them.
         self.low_spd_nul = config.getint('low_spd_nul', default=5, minval=1, maxval=10)
         self.send_step_duty = config.getint('send_step_duty', default=16, minval=0, maxval=10)
+        # probe_min_3err: the default agreement tolerance (mm) between two touch_probe()
+        # samples - touch_probe() accepts its result once the spread between any two collected
+        # samples is within this value (see touch_probe()'s own tolerance parameter, which
+        # defaults to this). The "_3" in the name reflects the default pro_cnt=3 samples
+        # collected before an agreement is required, not a hard-coded count here. Smaller
+        # means a stricter agreement requirement (more retries needed on a noisy sensor);
+        # larger accepts more scatter between repeated touches as "good enough."
         self.probe_min_3err = config.getfloat('probe_min_3err', default=0.1, minval=0.01)
+        # step_base: a multiplier applied on top of the Z stepper's own configured step
+        # distance (get_step_dist()) to get mm_per_step (see _handle_connect below) - i.e. the
+        # PRTouch MCU's raw step channel does not necessarily pulse at the same resolution as
+        # Klipper's own configured microstepping for that stepper. This printer's real value
+        # is 2 (confirmed via captured config), meaning one PRTouch MCU step pulse corresponds
+        # to 2 of the Z stepper's own configured microsteps. Get this wrong and every mm/step
+        # conversion in this module (distances, Z results, recovery-lift math) is silently
+        # off by exactly that ratio.
         self.step_base = config.getint('step_base', default=1, minval=1)
 
         # Safety ceilings (2026-08-09 hardening mission) - conservative, configurable, deliberately
@@ -161,8 +232,10 @@ class PrtouchProbe:
                                                       minval=1.)
         # max_baseline_abs: a sanity envelope for the raw, unfiltered deal_avgs_prtouch
         # reading, not a trigger threshold - live hardware's own documented at-rest baseline is
-        # roughly -251,500 (NON_MOTION_VALIDATION.md, DESIGN.md 2026-08-05 entry); this default
-        # gives roughly 20x headroom above that magnitude before treating a reading as
+        # roughly -251,500 (captured directly from real hardware and preserved as this
+        # codebase's own test fixture data - see prtouch_test_support.py and the
+        # sensor_consistency_* comments below for where this exact figure recurs); this
+        # default gives roughly 20x headroom above that magnitude before treating a reading as
         # implausible/saturated/disconnected, deliberately wide since the real dynamic range
         # under an actual approaching/contacting nozzle is unmeasured (NEEDS_HARDWARE_DATA).
         self.max_baseline_abs = config.getfloat('max_baseline_abs', default=5000000.,
@@ -183,7 +256,7 @@ class PrtouchProbe:
         # NEEDS_HARDWARE_DATA, not a fabricated threshold. Once real at-rest values are known
         # (see read_diagnostics()/READ_PRES for how to capture them), set baseline_reference to
         # those 4 values and baseline_deviation_max to a real, qualified tolerance to activate
-        # it - see docs/prtouch_diagnostics.md.
+        # it.
         self.baseline_reference = config.getfloatlist('baseline_reference', default=None,
                                                         count=4)
         self.baseline_deviation_max = config.getfloat('baseline_deviation_max', default=None,
@@ -210,15 +283,18 @@ class PrtouchProbe:
         # raw_op_settle_s: minimum yield after a disarm before the next arm. The real minimum
         # safe gap is NOT known - that needs hardware qualification - so this defaults to
         # tri_send_ms (the same value the MCU firmware itself uses, via check_delay(), to pace
-        # its own buffered-sample sends on this exact channel - confirmed against
-        # reference/prtouch_v2.c), converted to seconds, rather than an invented constant.
+        # its own buffered-sample sends on this exact channel - confirmed against Creality's
+        # own officially published source for this board, see
+        # docs/prtouch_timer_incident_forensics.md sec 7), converted to seconds, rather
+        # than an invented constant.
         # None (the default) means "derive from tri_send_ms"; set explicitly once real
         # hardware timing margins are measured.
         self._raw_op_settle_s_override = config.getfloat('raw_op_settle_s', default=None,
                                                            minval=0.)
 
         # Sensor-consistency guard (2026-08-11, physical-qualification closure mission - see
-        # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's follow-up): live testing found that a
+        # docs/prtouch_timer_incident_forensics.md for the related incident work from the
+        # same qualification effort): live testing found that a
         # SINGLE deal_avgs_prtouch read (the guard above) is not sufficient. After a raw step
         # operation (safe_move_z, or touch_probe's own down/lift phases), READ_PRES was
         # observed to intermittently return near-zero/partial-magnitude garbage (e.g. -1,
@@ -242,9 +318,10 @@ class PrtouchProbe:
         self.sensor_baseline_max_drift = config.getfloat(
             'sensor_baseline_max_drift', default=10000., minval=1.)
         # Persisted per-channel reference (2026-08-12, root-cause mission - see
-        # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's disassembly-grounded root-cause
-        # section): a SESSION-LOCAL auto-learned baseline (the original 2026-08-11 version of
-        # this guard) has a real gap - if the sensor is already corrupted before the first
+        # docs/prtouch_timer_incident_forensics.md sec 7 for the disassembly-grounded
+        # root-cause work from the same investigation): a SESSION-LOCAL auto-learned baseline
+        # (the original 2026-08-11 version of this guard) has a real gap - if the sensor is
+        # already corrupted before the first
         # healthy-looking read this session (e.g. Klipper restarted while the MCU/HX711 was
         # still in a corrupted state from an earlier raw step op), a corrupted-but-internally-
         # consistent reading could get learned as "healthy" with nothing to compare it against.
@@ -381,7 +458,8 @@ class PrtouchProbe:
     def _own_raw_operation(self, op_name):
         """Reject a second raw PRTouch operation that tries to start while one (touch_probe or
         safe_move_z) is already active, instead of letting it queue behind/interleave with the
-        first - see module docstring and docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md secs 3/9.
+        first - see module docstring and docs/prtouch_timer_incident_forensics.md for the
+        incident this guard was added in response to.
         Checked and set with no yield in between, so this is race-free under Klipper's single-
         threaded/cooperative reactor without needing a lock: whichever call reaches this line
         first always sets the flag before it can ever yield (via reactor.pause(), which only
@@ -437,18 +515,20 @@ class PrtouchProbe:
         start_pres_prtouch, which safe_move_z deliberately does not (see below).
 
         2026-08-12 stock-vs-NebulaOS fidelity mission: the one confirmed remaining deviation
-        from reference/prtouch_v2_wrapper.py's own safe_move_z() (lines 1122-1151) is that stock
-        arms start_pres_prtouch concurrently with every real move (so a manual jog can itself
-        register a trigger and early-stop), while this stays step-only/blind on purpose - this
-        tool exists to isolate raw step behavior from pressure-channel complexity, and a
-        diagnostic that can silently early-stop on a spurious trigger would defeat that purpose.
-        This is unrelated to the read_pres_prtouch/prtouch_event ISR-collision corruption
-        mechanism (see NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 12) - that lives entirely
-        inside the raw pressure read, not in whether start_pres happens to be armed during a
-        step move - and both this path and _touch_probe()'s share the same _settle_after_disarm
-        gap and fail-closed sensor-consistency guard, so this simplification carries no cost
-        against that mechanism. Classified NEBULAOS SAFETY IMPROVEMENT / DELIBERATE
-        SIMPLIFICATION, not a bug - see that same doc's sec 15."""
+        from Creality's own original safe_move_z() (prtouch_v2_wrapper.py, GPLv3-licensed
+        Creality source, not included in this tree) is that stock arms start_pres_prtouch
+        concurrently with every real move (so a manual jog can itself register a trigger and
+        early-stop), while this stays step-only/blind on purpose - this tool exists to isolate
+        raw step behavior from pressure-channel complexity, and a diagnostic that can silently
+        early-stop on a spurious trigger would defeat that purpose. This is unrelated to
+        whatever mechanism intermittently corrupts a raw pressure read after a step operation
+        (see check_sensor_consistency's own docstring, and this class's __init__ comment on
+        sensor_consistency_reads, for that separate, still-not-fully-explained corruption) -
+        that lives entirely inside the raw pressure read itself, not in whether start_pres
+        happens to be armed during a step move - and both this path and _touch_probe()'s share
+        the same _settle_after_disarm gap and fail-closed sensor-consistency guard, so this
+        simplification carries no cost against that mechanism. Classified NEBULAOS SAFETY
+        IMPROVEMENT / DELIBERATE SIMPLIFICATION, not a bug."""
         with self._own_raw_operation('safe_move_z') as op_id:
             self._raw_move(direction, distance, speed, op_id)
 
@@ -489,9 +569,11 @@ class PrtouchProbe:
         motion stacked on top of an already-completed recovery - confirmed live: a single
         non-retried PRTOUCH_TEST_TOUCH attempt produced 3 raw disarms (descent, recovery lift,
         this lift) instead of the 2 the sequence actually needed, each logging a MCU-side
-        `Timer too close` (docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 16 - that same
-        sequence did NOT crash the MCU; this is a redundant-motion cleanup, not a fix for the
-        separate, still-unresolved 2026-08-10 MCU-shutdown incident documented in sec 2)."""
+        `Timer too close` - that same sequence did NOT crash the MCU; this is a redundant-
+        motion cleanup, not a fix for the separate 2026-08-10 MCU-shutdown incident documented
+        in docs/prtouch_timer_incident_forensics.md sec 2 (that incident's own root cause is
+        now understood and fixed - see that doc's sec 7-10 - but this cleanup is independent
+        hardening, not itself the fix)."""
         logging.info("prtouch_probe: %s", message)
         self.last_error = message
         raise self.printer.command_error("prtouch: " + message)
@@ -643,8 +725,7 @@ class PrtouchProbe:
             else 0. for key in keys]
 
         if self._auto_baseline is None:
-            # NO_REFERENCE -> BOOTSTRAP_CANDIDATE (2026-08-12 root-cause mission - see
-            # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's final synthesis): an internally-
+            # NO_REFERENCE -> BOOTSTRAP_CANDIDATE (2026-08-12 root-cause mission): an internally-
             # consistent reading with nothing trusted to compare it against is NOT the same as
             # a verified-healthy reading - a sensor stuck at a stable-but-corrupted value would
             # look identical to this check on every single restart, forever. Deliberately does
@@ -726,14 +807,17 @@ class PrtouchProbe:
         return diag['raw']
 
     def touch_probe(self, down_min_z, retries=10, pro_cnt=3, tolerance=None):
-        """run_step_prtouch-equivalent (ANALYSIS.md secs 3-4): send start_step+start_pres
+        """run_step_prtouch-equivalent: send start_step+start_pres
         concurrently, collect both buffers, compute one Z sample via
         prtouch_calibration.compute_trigger_z(), lift back to the start height, and repeat
         until either two samples agree within tolerance or pro_cnt samples have been collected.
-        Raises command_error (via _fail, with the safety-lift courtesy) after `retries` attempts
-        without a usable sample - mirrors PR_NOT_TRIGGER/STEP_LOST/PRES_LOST (ANALYSIS.md sec 1)
-        at a reduced surface, using plain command_error rather than Creality's PR_ERR_CODE_*
-        catalog (DESIGN.md open question 3, resolved this way for the clean rewrite).
+        Raises command_error (via _fail - see its own docstring for why it no longer issues a
+        safety lift of its own as of 2026-08-13, since every call site has already fully
+        recovered the toolhead position before reaching it) after `retries` attempts without a
+        usable sample - mirrors Creality's own PR_NOT_TRIGGER/STEP_LOST/PRES_LOST error
+        catalog at a reduced surface, using plain command_error rather than reproducing
+        Creality's own PR_ERR_CODE_* numeric catalog (not needed for a rewrite that doesn't
+        need to match Creality's own GuppyScreen-facing error codes byte-for-byte).
 
         Raises PrtouchProbeSafetyError, before ever arming a single command, if another raw
         PRTouch operation is already active (see _own_raw_operation), down_min_z exceeds
@@ -856,9 +940,11 @@ class PrtouchProbe:
         return results[n // 2] if n % 2 == 1 else (results[n // 2 - 1] + results[n // 2]) / 2.
 
     def _lift_after_down(self, step_cnt, step_samples, op_id=None):
-        """'step' is the MCU's own remaining-pulse countdown (reference/prtouch_v2.c: now_steps
-        starts at the commanded total and decrements to 0 - confirmed directly from firmware
-        source, not inferred from the host wrapper alone), so step_cnt - last_reported_step is
+        """'step' is the MCU's own remaining-pulse countdown (Creality's own firmware:
+        now_steps starts at the commanded total and decrements to 0 - confirmed directly
+        against Creality's officially published source for this board, see
+        docs/prtouch_timer_incident_forensics.md sec 7, not inferred from the host wrapper
+        alone), so step_cnt - last_reported_step is
         the distance actually traveled by the time sampling stopped."""
         traveled = units.step_count_to_distance_mm(
             step_cnt - step_samples[-1]['step'], self.mm_per_step)
